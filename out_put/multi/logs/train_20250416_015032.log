@@ -1,0 +1,79 @@
+2025-04-16 01:50:32,289  INFO  ARGS = {
+  "notes": "回测300股指自回归",
+  "data_path": "database/processed_300股指_day.csv",
+  "output_dir": "out_put/multi",
+  "ckpt_dir": "ckpt",
+  "feature_columns": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    1
+  ],
+  "target_columns": [
+    [
+      1
+    ]
+  ],
+  "start_timestamp": 31,
+  "end_timestamp": -1,
+  "window_sizes": [
+    5,
+    10,
+    15
+  ],
+  "N_pairs": 3,
+  "num_classes": 3,
+  "generators": [
+    "gru",
+    "lstm",
+    "transformer"
+  ],
+  "discriminators": null,
+  "distill_epochs": 1,
+  "cross_finetune_epochs": 5,
+  "device": [
+    0
+  ],
+  "num_epochs": 10000,
+  "lr": 2e-05,
+  "batch_size": 64,
+  "train_split": 0.7,
+  "random_seed": 3407,
+  "amp_dtype": "none",
+  "mode": "train",
+  "ckpt_path": "lastest"
+}
+2025-04-16 01:50:35,313  INFO  Start cross finetune!  G3 with D3
+2025-04-16 01:50:35,895  INFO  == Cross finetune Epoch [1/10000]: G3: Validation MSE 0.00219553
+2025-04-16 01:50:36,481  INFO  == Cross finetune Epoch [2/10000]: G3: Validation MSE 0.00096147
+2025-04-16 01:50:37,158  INFO  == Cross finetune Epoch [3/10000]: G3: Validation MSE 0.00057292
+2025-04-16 01:50:37,960  INFO  == Cross finetune Epoch [4/10000]: G3: Validation MSE 0.00087584
+2025-04-16 01:50:38,536  INFO  == Cross finetune Epoch [5/10000]: G3: Validation MSE 0.00044149
+2025-04-16 01:50:38,536  INFO  EPOCH 1 | Validation MSE: G1: 0.21626994, G2: 0.31654134, G3: 0.06965398 
+2025-04-16 01:50:40,409  INFO  EPOCH 2 | Validation MSE: G1: 0.17613940, G2: 0.29473108, G3: 0.00059498 
+2025-04-16 01:50:42,296  INFO  EPOCH 3 | Validation MSE: G1: 0.13933872, G2: 0.27341914, G3: 0.00041798 
+2025-04-16 01:50:44,103  INFO  EPOCH 4 | Validation MSE: G1: 0.10520628, G2: 0.25198022, G3: 0.00038885 
+2025-04-16 01:50:46,118  INFO  EPOCH 5 | Validation MSE: G1: 0.07549103, G2: 0.23004571, G3: 0.00042547 
+2025-04-16 01:50:47,691  INFO  EPOCH 6 | Validation MSE: G1: 0.05143572, G2: 0.20702563, G3: 0.00046393 
+2025-04-16 01:50:49,343  INFO  EPOCH 7 | Validation MSE: G1: 0.03395313, G2: 0.18232647, G3: 0.00044039 
+2025-04-16 01:50:51,391  INFO  EPOCH 8 | Validation MSE: G1: 0.02321607, G2: 0.15558219, G3: 0.00049154 
+2025-04-16 01:50:53,447  INFO  EPOCH 9 | Validation MSE: G1: 0.01697009, G2: 0.12694916, G3: 0.00124574 
+2025-04-16 01:50:55,576  INFO  EPOCH 10 | Validation MSE: G1: 0.01347971, G2: 0.09612955, G3: 0.00033646 
+2025-04-16 01:50:57,631  INFO  Start cross finetune!  G3 with D1
+2025-04-16 01:50:58,226  INFO  == Cross finetune Epoch [1/10000]: G3: Validation MSE 0.00045025
+2025-04-16 01:50:58,795  INFO  == Cross finetune Epoch [2/10000]: G3: Validation MSE 0.00064757

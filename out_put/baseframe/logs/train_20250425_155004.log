@@ -1,0 +1,42 @@
+2025-04-25 15:50:04,570  INFO  ARGS = {
+  "notes": "回测300股指自回归",
+  "data_path": "database/processed_大豆_day.csv",
+  "output_dir": "out_put/baseframe",
+  "ckpt_dir": "ckpt",
+  "feature_columns": [
+    4
+  ],
+  "target_columns": [
+    [
+      4
+    ]
+  ],
+  "start_timestamp": 31,
+  "end_timestamp": -1,
+  "window_sizes": [
+    15
+  ],
+  "predict_step": 1,
+  "action": true,
+  "N_pairs": 1,
+  "num_classes": 3,
+  "generators": [
+    "transformer"
+  ],
+  "discriminators": null,
+  "distill_epochs": 0,
+  "cross_finetune_epochs": 0,
+  "device": [
+    0
+  ],
+  "num_epochs": 1024,
+  "lr": 2e-05,
+  "batch_size": 64,
+  "train_split": 0.7,
+  "random_seed": 3407,
+  "amp_dtype": "none",
+  "mode": "train",
+  "ckpt_path": "lastest"
+}
+2025-04-25 15:50:18,929  INFO  Train Metrics for G1: MSE=5482.3814, MAE=56.0408, RMSE=74.0431, MAPE=1.3238
+2025-04-25 15:50:19,629  INFO  Test Metrics for G1: MSE=36225.1561, MAE=143.0351, RMSE=190.3291, MAPE=2.5274

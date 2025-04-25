@@ -1,0 +1,39 @@
+2025-04-24 17:56:59,345  INFO  ARGS = {
+  "notes": "回测300股指自回归",
+  "data_path": "database/process_工商银行.csv",
+  "output_dir": "out_put/baseframe",
+  "ckpt_dir": "ckpt",
+  "feature_columns": [
+    4
+  ],
+  "target_columns": [
+    [
+      4
+    ]
+  ],
+  "start_timestamp": 31,
+  "end_timestamp": -1,
+  "window_sizes": [
+    15
+  ],
+  "predict_step": 5,
+  "N_pairs": 1,
+  "num_classes": 3,
+  "generators": [
+    "transformer"
+  ],
+  "discriminators": null,
+  "distill_epochs": 0,
+  "cross_finetune_epochs": 0,
+  "device": [
+    0
+  ],
+  "num_epochs": 1024,
+  "lr": 2e-05,
+  "batch_size": 64,
+  "train_split": 0.7,
+  "random_seed": 3407,
+  "amp_dtype": "none",
+  "mode": "train",
+  "ckpt_path": "lastest"
+}
