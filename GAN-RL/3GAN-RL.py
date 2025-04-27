@@ -85,6 +85,8 @@ class FCGenerator(nn.Module):
 
     def forward(self, x):
         batch_size = x.size(0)
+        if x.device != next(self.parameters()).device:
+            x = x.to(next(self.parameters()).device)
         x = x.view(batch_size, -1)
         fc_out = self.fc(x)
         state_particles = self.state_head(fc_out).view(-1,  STATE_PARTICLES , PRICE_FEATURES)
@@ -129,6 +131,10 @@ class StockTradingAgent:
         self.memory = deque(maxlen=MEMORY_SIZE)
         self.manager = ModelManager(self, None)
         self._init_training_history()
+        self.epsilon_start = 1.0   # 初始探索率
+        self.epsilon_end = 0.05    # 最终探索率
+        self.epsilon_decay = 200    # 衰减周期（指数形式）
+        self.current_episode = 0   # 新增episode计数器
 
     def _init_training_history(self):
         """扩展训练历史记录"""
@@ -291,8 +297,15 @@ class StockTradingAgent:
         for g_idx in range(len(self.generators)):
             for t_param, o_param in zip(self.target_generators[g_idx].parameters(), self.generators[g_idx].parameters()):
                 t_param.data.copy_(tau * o_param.data + (1 - tau) * t_param.data)
-    def get_action(self, state, epsilon=0.2, eval_generator_idx=None):
+    def get_action(self, state, training = True, eval_generator_idx=None):
         """集成动作选择"""
+        if training:
+        # 指数衰减公式
+            epsilon = self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
+                    np.exp(-self.current_episode / self.epsilon_decay)
+        else:
+            epsilon = 0.001  # 测试时使用固定小概率探索        
+        
         if isinstance(state, np.ndarray):
             state = torch.FloatTensor(state).to(DEVICE)
         state_tensor = state.unsqueeze(0).to(DEVICE)  # 确保输入张量在GP
@@ -409,7 +422,7 @@ class ModelManager:
             step_history = []  # 用来记录每一步的详细数据
 
             while not done:
-                action = self.agent.get_action(state, epsilon)
+                action = self.agent.get_action(state, False)
                 next_state, reward, done, _ = self.env.step(action)
                 portfolio_history.append(self.env.balance + self.env.holdings * self.env.combined_data[self.env.current_step-1, 3])
                 metrics['action_dist'][action] += 1
@@ -475,7 +488,7 @@ class ModelManager:
                 while not done:
                     action = self.agent.get_action(
                         state, 
-                        epsilon=0.0,  # 禁用探索
+                        False,  # 禁用探索
                         eval_generator_idx=g_idx
                     )
                     next_state, reward, done, _ = self.env.step(action)
@@ -494,13 +507,13 @@ class ModelManager:
         # 采样真实数据
         batch = random.sample(self.agent.memory, batch_size)
         states, _, _, _, _ = zip(*batch)
-        real_states = torch.FloatTensor(np.array(states))
+        real_states = torch.FloatTensor(np.array(states)).to(DEVICE)
         real_price = real_states[:, :, :PRICE_FEATURES].reshape(-1, PRICE_FEATURES)
         
         # 生成假样本
         with torch.no_grad():
             for g_idx, gen in enumerate(self.agent.generators):
-                _, states, _, _ = gen(real_states)
+                _, states, _, _ = gen(real_states.to(DEVICE))
                 fake_samples[g_idx] = states.reshape(-1, PRICE_FEATURES)
         
         # 评估每个判别器
@@ -527,6 +540,39 @@ def load_and_process_data():
         
     return price_df
 
+# ==================== 增强型K线特征模块 ====================
+class EnhancedCandleFeatures:
+    pattern_threshold = 0.5  # 形态检测阈值
+    
+    @staticmethod
+    def detect_patterns(window):
+        """输入: 最近N根K线数据 (SEQ_LENGTH x 4)"""
+        features = np.zeros(12, dtype=np.float32)
+        
+        # 获取最近3根K线
+        curr = window[-1]
+        prev1 = window[-2] if len(window)>=2 else None
+        prev2 = window[-3] if len(window)>=3 else None
+
+        # 单K线特征
+        body = abs(curr[3]-curr[0])
+        upper = curr[1]-max(curr[0],curr[3])
+        lower = min(curr[0],curr[3])-curr[2]
+        
+        # 锤子线/上吊线
+        features[0] = 1 if (lower>2*body and upper<0.2*body) else 0
+        features[1] = 1 if (upper>2*body and lower<0.2*body) else 0
+
+        # 吞没模式（需要前1根）
+        if prev1 is not None:
+            bull_engulf = (curr[3]>prev1[0] and curr[0]<prev1[3]) and (curr[3]-curr[0])>0.6*(prev1[0]-prev1[3])
+            bear_engulf = (curr[3]<prev1[0] and curr[0]>prev1[3]) and (curr[0]-curr[3])>0.6*(prev1[3]-prev1[0])
+            features[2] = 1 if bull_engulf else 0
+            features[3] = 1 if bear_engulf else 0
+
+        # 可以进一步加入其他特征检测（晨星、三兵等），尚未实现
+        
+        return features
 
 
 class StockTradingEnv:
@@ -537,6 +583,8 @@ class StockTradingEnv:
         self.seq_length = seq_length
         self.current_step = seq_length
         self.position = 0.0
+        self.debt = 0 # 借入债务
+        self.leverage = 3  # 杠杆倍数
 
         self.transFee = 100  # 添加交易手续费
         self.init_balance = 500000  # 初始资金
@@ -585,53 +633,74 @@ class StockTradingEnv:
     def step(self, action):
         prev_close = self.combined_data[self.current_step-2, 3]  
         current_close = self.combined_data[self.current_step-1, 3]
-        reward_k = 0
 
-        # # 修改动作处理逻辑
-        # if action == 0 and self.balance > 0:    # 买入
-        #     if self.balance > self.transFee:
-        #         max_afford = (self.balance - self.transFee) / current_close
-        #         self.holdings += max_afford
-        #         self.balance = 0
-        #         if current_close > prev_close:
-        #             reward_k += 1
-        # elif action == 1 and self.holdings > 0:  # 卖出
-        #     if self.holdings > 0:
-        #         sell_value = self.holdings * current_close
-        #         if sell_value > self.transFee:
-        #             self.balance += sell_value - self.transFee
-        #             self.holdings = 0
-        #         if current_close < prev_close:
-        #             reward_k += 1
-        # 修改后的动作处理逻辑
         if action == 0:  # 买入开多仓
-            if self.balance > self.transFee:
-                max_afford = (self.balance - self.transFee) / current_close
+                    # if self.balance > self.transFee:
+        #                 # 风险控制计算
+        #                 max_allowable_loss = current_value * self.max_risk_per_trade
+        #                 price_risk = current_close * self.stop_loss_pct
+        #                 max_position_by_risk = max_allowable_loss / price_risk
+
+        #                 # 杠杆计算的最大可买量
+        #                 max_leverage_position = ((current_value * self.leverage) - self.transFee) / current_close
+
+        #                 # 取风险限制和杠杆限制的较小值
+        #                 actual_position = min(max_position_by_risk, max_leverage_position)
+
+        #                 self.holdings += actual_position
+        #                 self.balance = max(current_value - actual_position * current_close - self.transFee, 0)
+            current_value = self.balance + self.holdings * current_close
+            net_asset = current_value - self.debt  # 计算净资产（扣除已有负债）
+            new_debt = max(net_asset * (self.leverage - 1) - self.debt, 0)
+            if new_debt + self.balance > 0:
+                max_afford = (new_debt + self.balance - self.transFee) / current_close
                 self.holdings += max_afford
-                self.balance = 0  # 全部余额用于买入
+                self.debt += new_debt
+                self.balance = 0
         elif action == 1:  # 卖出开空仓
-            if self.balance > self.transFee:
+            if self.holdings > 0:  # 平多仓
+                sell_value = self.holdings * current_close
+                if sell_value >= self.transFee:
+                    net_proceeds = sell_value - self.transFee
+                    repay = min(net_proceeds, self.debt)
+                    self.debt -= repay
+                    self.balance += (net_proceeds - repay)
+                self.holdings = 0
+            if self.balance >= self.transFee:
                 max_afford = (self.balance - self.transFee) / current_close
                 self.holdings -= max_afford  # 持仓变为负数表示空头
                 self.balance += max_afford * current_close - self.transFee  # 卖出获得资金
         elif action == 2:  # 平仓
             if self.holdings > 0:  # 平多仓
                 sell_value = self.holdings * current_close
-                if sell_value > self.transFee:
-                    self.balance += sell_value - self.transFee
-                    self.holdings = 0
+                if sell_value >= self.transFee:
+                    net_proceeds = sell_value - self.transFee
+                    repay = min(net_proceeds, self.debt)
+                    self.debt -= repay
+                    self.balance += (net_proceeds - repay)
+                self.holdings = 0
             elif self.holdings < 0:  # 平空仓
                 required_cash = abs(self.holdings) * current_close + self.transFee
                 if self.balance >= required_cash:
                     self.balance -= required_cash
                     self.holdings = 0
 
-
+        # 添加趋势跟随奖励
+        trend_reward = 0
+        ma_short = np.mean(self.combined_data[self.current_step-5:self.current_step, 3])
+        ma_long = np.mean(self.combined_data[self.current_step-20:self.current_step, 3])
+        if (action == 0) and (ma_short > ma_long):  # 趋势向上时买入奖励
+            trend_reward += 0.5
+        elif (action == 1) and (ma_short < ma_long):  # 趋势向下时卖出奖励
+            trend_reward += 0.5
+        
+        
         # 计算新奖励函数
-        current_value = self.balance + self.holdings * current_close
+        current_value = self.balance + self.holdings * current_close - self.debt
         self.portfolio_values.append(current_value)
-        reward = self._calculate_reward(current_value)  +  5 * reward_k
-        # reward = self._calculate_reward(current_value) 
+
+        reward = self._calculate_reward(current_value) + trend_reward
+        
         self.current_step += 1  # 移动到下一个时间步
         done = self.current_step >= len(self.combined_data) - 1
         return self._get_state(), reward, done, {}
@@ -665,9 +734,68 @@ class StockTradingEnv:
     def _get_state(self):
         raw_state = self.combined_data[self.current_step-self.seq_length : self.current_step]
         noisy_state = self._add_noise(raw_state)
-        return torch.FloatTensor(noisy_state).to(DEVICE).cpu().numpy()
+        return noisy_state
 
+# ==================== K线驱动环境 ==================== 
+class PureCandleEnv(StockTradingEnv):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pattern_memory = deque([0.0]*5, maxlen=5)  # 初始填充5个0
 
+    def _get_state(self):
+        raw = self.combined_data[self.current_step-self.seq_length : self.current_step]
+        patterns = EnhancedCandleFeatures.detect_patterns(raw)
+        
+        # 确保memory部分始终为5维
+        memory = list(self.pattern_memory)[-5:]  # 取最后5个元素
+        if len(memory) < 5:  # 填充不足部分
+            memory += [0.0]*(5 - len(memory))
+
+        # 构建新状态向量
+        state = np.concatenate([
+            raw.flatten(),               # 原始价格序列 (10x4=40)
+            patterns,                    # K线特征 (12)
+            self.pattern_memory,         # 形态记忆 (5)
+            [self.holdings/self.init_balance]  # 归一化持仓 (1)
+        ], dtype=np.float32)
+        
+        return self._add_noise(state)
+    
+    def step(self, action):
+        old_step = super().step(action)
+        current_pattern = EnhancedCandleFeatures.detect_patterns(
+            self.combined_data[self.current_step-3:self.current_step]
+        )
+        logger.debug(
+            "Step %d: 动作=%d, 仓位=%.2f, 余额=%.2f, 价值变化: %.2f → %.2f",
+            self.current_step, action, self.holdings, self.balance
+        )
+        self.pattern_memory.append(np.mean(current_pattern[:8]))
+        
+        return (*old_step[:3], {'pattern': current_pattern})  
+    
+    def _pattern_reward(self, action, patterns):
+        """K线模式奖励"""
+        reward = 0
+        
+        # 持仓状态映射
+        position = self.holdings / self.init_balance  # 归一化仓位
+        
+        # # 基础模式奖励
+        # reward += patterns[2] * 1.5   # 看涨吞没
+        # reward += patterns[3] * -1.5  # 看跌吞没
+        # reward += patterns[4] * 2.0   # 晨星
+        # reward += patterns[5] * -2.0  # 暮星
+        
+        # 仓位匹配奖励
+        if position > 0.1:  # 持多仓
+            reward += patterns[0] * 0.5  # 锤子线奖励
+            reward -= patterns[1] * 1.0  # 上吊线惩罚
+        elif position < -0.1:  # 持空仓
+            reward += patterns[1] * 0.5  # 上吊线奖励
+            reward -= patterns[0] * 1.0  # 锤子线惩罚
+            
+        return reward  # 控制奖励规模
 
 # ==================== 训练与测试 ====================
 def plot_training_metrics(agent, episode, val_metrics=None):
@@ -740,7 +868,13 @@ def train():
         while not done:
             action = agent.get_action(state)
             next_state, reward, done, _ = env.step(action)
-            agent.memory.append((state.copy(), action, reward, next_state.copy(), done))
+            agent.memory.append((
+                state.copy() if isinstance(state, np.ndarray) else state.cpu().numpy(),
+                action,
+                reward,
+                next_state.copy() if isinstance(next_state, np.ndarray) else next_state.cpu().numpy(),
+                done
+            ))
             state = next_state
             total_reward += reward
 

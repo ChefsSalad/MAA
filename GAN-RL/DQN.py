@@ -96,7 +96,7 @@ class DQNAgent:
         self._init_training_history()
 
         self.epsilon_start = 1.0   # 初始探索率
-        self.epsilon_end = 0.05    # 最终探索率
+        self.epsilon_end = 0.08    # 最终探索率
         self.epsilon_decay = 200    # 衰减周期（指数形式）
         self.current_episode = 0   # 新增episode计数器
 
@@ -518,8 +518,6 @@ class StockTradingEnv:
                     self.balance -= required_cash
                     self.holdings = 0
 
-        current_value = self.balance + self.holdings * current_close - self.debt
-        self.portfolio_values.append(current_value)
         
         # 添加趋势跟随奖励
         trend_reward = 0
@@ -533,7 +531,7 @@ class StockTradingEnv:
         # 计算新奖励函数
         current_value = self.balance + self.holdings * current_close - self.debt
         self.portfolio_values.append(current_value)
-        # reward = self._calculate_reward(current_value)  +  5 * reward_k
+
         reward = self._calculate_reward(current_value) + trend_reward
 
         self.current_step += 1  # 移动到下一个时间步
@@ -543,8 +541,7 @@ class StockTradingEnv:
     def _calculate_reward(self, current_value):
         # 1. 对数收益率 (更稳定)
         if len(self.portfolio_values) >= 2:
-            prev_value = self.portfolio_values[-2]
-            returns = current_value / (500000)   # 百分比形式
+            returns = (current_value - self.init_balance) / 50000
         else:
             returns = 0.0
 
@@ -570,22 +567,20 @@ class StockTradingEnv:
         # turnover_penalty = -position_change * 0.1
         # self.prev_holdings = self.holdings
 
-        # 6. 胜率奖励 (长期窗口)
-        win_rate_reward = 0
-        if len(self.portfolio_values) > 100:
-            positive_returns = np.sum(np.diff(self.portfolio_values[-100:]) > 0)
-            win_rate = positive_returns / 99
-            win_rate_reward = 2.0 * (win_rate - 0.5)  # 胜率超过50%才奖励
+        # # 6. 胜率奖励 (长期窗口)
+        # win_rate_reward = 0
+        # if len(self.portfolio_values) > 100:
+        #     positive_returns = np.sum(np.diff(self.portfolio_values[-100:]) > 0)
+        #     win_rate = positive_returns / 99
+        #     win_rate_reward = 2.0 * (win_rate - 0.5)  # 胜率超过50%才奖励
 
         # 组合奖励
-        total_reward = (
-            returns * 0.5 + 
+        total_reward = returns * 0.5
             # sharpe_reward + 
             # drawdown_penalty + 
             # volatility_penalty * 0.3 + 
             # turnover_penalty + 
-            win_rate_reward
-        )
+            # win_rate_reward
         return total_reward
 
     def _get_state(self):
@@ -763,7 +758,7 @@ def train():
         agent.training_history['base_rewards'].append(total_base_reward)
         agent.training_history['pattern_rewards'].append(total_pattern_reward)
         # 定期评估和保存
-        if episode % 3 == 0:
+        if episode % 5 == 0:
             val_metrics = manager.evaluate(n_episodes=5)
             logger.info(f"{json.dumps({'mean_return': float(val_metrics['mean_return']),'std_return': float(val_metrics['std_return']),'action_dist': val_metrics['action_dist']}, indent=2)}")
             

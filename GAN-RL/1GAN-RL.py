@@ -1,7 +1,3 @@
-# 三路交叉对抗D3QN架构（统一输入版本）
-# 生成器生成状态粒子和动作价值，判别器评估状态分布
-# 输入：合并后的特征（价格+技术+基本面）
-
 import os
 import sys
 import json
@@ -353,14 +349,6 @@ class ModelManager:
             'steps': metrics['steps']  # 返回每个回合的步骤信息
         }
 
-    def _calculate_drawdown(self, portfolio_values):
-        """计算最大回撤"""
-        max_drawdowns = []
-        for pv in portfolio_values:
-            peak = np.maximum.accumulate(pv)
-            trough = np.minimum.accumulate(pv)
-            max_drawdowns.append(np.max((peak - trough)/peak))
-        return np.mean(max_drawdowns)
 
 # ==================== 数据与环境 ====================
 def load_and_process_data():
@@ -382,8 +370,10 @@ class StockTradingEnv:
         self.current_step = seq_length
         self.position = 0.0
 
-        self.transFee = 100  # 添加交易手续费
+        self.transFee = 0  # 添加交易手续费
         self.init_balance = 500000  # 初始资金
+        self.debt = 0
+        self.leverage = 3  # 杠杆倍数
 
         # 噪声配置参数
         self.noise_level = 0.01  # 初始噪声水平
@@ -429,59 +419,74 @@ class StockTradingEnv:
     def step(self, action):
         prev_close = self.combined_data[self.current_step-2, 3]  
         current_close = self.combined_data[self.current_step-1, 3]
-        reward_k = 0
-
-        # 有手续费版
-        # if action == 0:  # 买入开多仓
-        #     if self.balance > self.transFee:
-        #         max_afford = (self.balance - self.transFee) / current_close
-        #         self.holdings += max_afford
-        #         self.balance = 0  # 全部余额用于买入
-        # elif action == 1:  # 卖出开空仓
-        #     if self.balance > self.transFee:
-        #         max_afford = (self.balance - self.transFee) / current_close
-        #         self.holdings -= max_afford  # 持仓变为负数表示空头
-        #         self.balance += max_afford * current_close - self.transFee  # 卖出获得资金
-        # elif action == 2:  # 平仓
-        #     if self.holdings > 0:  # 平多仓
-        #         sell_value = self.holdings * current_close
-        #         if sell_value > self.transFee:
-        #             self.balance += sell_value - self.transFee
-        #             self.holdings = 0
-        #     elif self.holdings < 0:  # 平空仓
-        #         required_cash = abs(self.holdings) * current_close + self.transFee
-        #         if self.balance >= required_cash:
-        #             self.balance -= required_cash
-        #             self.holdings = 0
 
         if action == 0:  # 买入开多仓
-            if self.balance > 0:
-                max_afford = (self.balance - 0) / current_close
+            # if self.balance > self.transFee:
+#                 # 风险控制计算
+#                 max_allowable_loss = current_value * self.max_risk_per_trade
+#                 price_risk = current_close * self.stop_loss_pct
+#                 max_position_by_risk = max_allowable_loss / price_risk
+
+#                 # 杠杆计算的最大可买量
+#                 max_leverage_position = ((current_value * self.leverage) - self.transFee) / current_close
+
+#                 # 取风险限制和杠杆限制的较小值
+#                 actual_position = min(max_position_by_risk, max_leverage_position)
+                
+#                 self.holdings += actual_position
+#                 self.balance = max(current_value - actual_position * current_close - self.transFee, 0)
+            current_value = self.balance + self.holdings * current_close
+            net_asset = current_value - self.debt  # 计算净资产（扣除已有负债）
+            new_debt = max(net_asset * (self.leverage - 1) - self.debt, 0)
+            if new_debt + self.balance > 0:
+                max_afford = (new_debt + self.balance - self.transFee) / current_close
                 self.holdings += max_afford
-                self.balance = 0  # 全部余额用于买入
+                self.debt += new_debt
+                self.balance = 0
         elif action == 1:  # 卖出开空仓
-            if self.balance > 0:
-                max_afford = (self.balance - 0) / current_close
+            if self.holdings > 0:  # 平多仓
+                sell_value = self.holdings * current_close
+                if sell_value >= self.transFee:
+                    net_proceeds = sell_value - self.transFee
+                    repay = min(net_proceeds, self.debt)
+                    self.debt -= repay
+                    self.balance += (net_proceeds - repay)
+                self.holdings = 0
+            if self.balance >= self.transFee:
+                max_afford = (self.balance - self.transFee) / current_close
                 self.holdings -= max_afford  # 持仓变为负数表示空头
-                self.balance += max_afford * current_close - 0  # 卖出获得资金
+                self.balance += max_afford * current_close - self.transFee  # 卖出获得资金
         elif action == 2:  # 平仓
             if self.holdings > 0:  # 平多仓
                 sell_value = self.holdings * current_close
-                if sell_value > 0:
-                    self.balance += sell_value - 0
-                    self.holdings = 0
+                if sell_value >= self.transFee:
+                    net_proceeds = sell_value - self.transFee
+                    repay = min(net_proceeds, self.debt)
+                    self.debt -= repay
+                    self.balance += (net_proceeds - repay)
+                self.holdings = 0
             elif self.holdings < 0:  # 平空仓
-                required_cash = abs(self.holdings) * current_close + 0
+                required_cash = abs(self.holdings) * current_close + self.transFee
                 if self.balance >= required_cash:
                     self.balance -= required_cash
                     self.holdings = 0
 
+        
+        # 添加趋势跟随奖励
+        trend_reward = 0
+        ma_short = np.mean(self.combined_data[self.current_step-5:self.current_step, 3])
+        ma_long = np.mean(self.combined_data[self.current_step-20:self.current_step, 3])
+        if (action == 0) and (ma_short > ma_long):  # 趋势向上时买入奖励
+            trend_reward += 0.5
+        elif (action == 1) and (ma_short < ma_long):  # 趋势向下时卖出奖励
+            trend_reward += 0.5
 
 
         # 计算新奖励函数
-        current_value = self.balance + self.holdings * current_close
+        current_value = self.balance + self.holdings * current_close - self.debt
         self.portfolio_values.append(current_value)
-        reward = self._calculate_reward(current_value)  +  5 * reward_k
+
+        reward = self._calculate_reward(current_value) + trend_reward
 
         self.current_step += 1  # 移动到下一个时间步
         done = self.current_step >= len(self.combined_data) - 1
@@ -517,6 +522,7 @@ class StockTradingEnv:
         raw_state = self.combined_data[self.current_step-self.seq_length : self.current_step]
         return self._add_noise(raw_state)
 
+
 # ==================== 训练与测试 ====================
 def plot_training_metrics(agent, episode, val_metrics=None):
     """绘制训练指标"""
@@ -548,7 +554,7 @@ def plot_training_metrics(agent, episode, val_metrics=None):
     if val_metrics:
         plt.subplot(3, 4, 7)
         plt.bar(['Return', 'Sharpe', 'Drawdown'], 
-                [val_metrics['mean_return'], val_metrics['sharpe_ratio'], val_metrics['max_drawdown']],
+                [val_metrics['mean_return'], val_metrics['max_drawdown']],
                 color=['green', 'blue', 'red'])
         plt.title('Validation Metrics')
 
@@ -597,17 +603,10 @@ def train():
         agent.training_history['adv_losses'].append(adv_loss)
 
         # 定期保存与评估
-        if episode % 3 == 0:
+        if episode % 5 == 0:
             agent.manager.save_checkpoint(episode)
             val_metrics = agent.manager.evaluate(n_episodes=5)
-            logger.info(f"验证指标：{json.dumps({
-                'mean_return': float(val_metrics['mean_return']),
-                'std_return': float(val_metrics['std_return']),
-                'sharpe_ratio': float(val_metrics['sharpe_ratio']),
-                'max_drawdown': float(val_metrics['max_drawdown']),
-                'action_dist': val_metrics['action_dist'],
-                'steps':val_metrics['steps']
-            }, indent=2)}")
+            logger.info(f"验证指标：{json.dumps({'mean_return': float(val_metrics['mean_return']),'action_dist': val_metrics['action_dist']}, indent=2)}")
             
             if val_metrics['mean_return'] > agent.manager.best_reward:
                 agent.manager.best_reward = val_metrics['mean_return']
