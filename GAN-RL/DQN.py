@@ -41,6 +41,7 @@ LR = 0.001
 GAMMA = 0.9
 MEMORY_SIZE = 10000
 TAU = 0.01  # 软更新参数
+ENTROPY_COEFF = 0.1  # 控制熵正则化的强度
 
 # 路径配置
 MODEL_DIR = "dqn_models"
@@ -91,14 +92,18 @@ class DQNAgent:
         self.target_net.eval()
         
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=LR)
-        self.memory = deque(maxlen=MEMORY_SIZE)
+        # self.memory = deque(maxlen=MEMORY_SIZE)
         self.manager = ModelManager(self, None)
         self._init_training_history()
 
         self.epsilon_start = 1.0   # 初始探索率
-        self.epsilon_end = 0.08    # 最终探索率
+        self.epsilon_end = 0.1    # 最终探索率
         self.epsilon_decay = 200    # 衰减周期（指数形式）
         self.current_episode = 0   # 新增episode计数器
+
+        self.memory = PrioritizedReplayBuffer(MEMORY_SIZE, alpha=0.6)
+        self.beta = 0.4  # 重要性采样补偿系数
+        self.beta_increment = 0.001  # 每次采样后的增量
 
     def _init_training_history(self):
         self.training_history = {
@@ -111,10 +116,12 @@ class DQNAgent:
         }
 
     def update(self):
-        if len(self.memory) < BATCH_SIZE:
+        if len(self.memory.buffer) < BATCH_SIZE:
             return 0
         
-        batch = random.sample(self.memory, BATCH_SIZE)
+        batch, indices, weights = self.memory.sample(BATCH_SIZE, self.beta)
+        weights = torch.tensor(weights, device=device, dtype=torch.float32)
+
         states, actions, rewards, next_states, dones = zip(*batch)
         
         # states = torch.FloatTensor(np.array(states))
@@ -130,8 +137,8 @@ class DQNAgent:
         dones = torch.tensor(dones, dtype=torch.float32, device=device)
 
         # 计算当前Q值
-        current_q, _, _ = self.online_net(states)
-        current_q = current_q.gather(1, actions.unsqueeze(1))
+        all_q, _, _ = self.online_net(states)
+        current_q = all_q.gather(1, actions.unsqueeze(1))
 
         # 计算目标Q值（Double DQN）
         with torch.no_grad():
@@ -141,23 +148,39 @@ class DQNAgent:
             target_q = target_q.gather(1, best_actions.unsqueeze(1))
             target = rewards + (1 - dones) * GAMMA * target_q.squeeze()
 
-        # 计算损失
-        loss = F.mse_loss(current_q.squeeze(), target)
+        # 计算TD误差作为优先级
+        td_errors = (current_q.squeeze() - target).abs().detach().cpu().numpy()
+        self.memory.update_priorities(indices, td_errors + 1e-5)  # 避免零优先级
 
+
+        # 计算损失
+        mse_loss = F.mse_loss(current_q.squeeze(), target)
+        # ======== 新增熵正则化部分 ========
+        # 计算策略熵（使用softmax概率）
+        probs = F.softmax(all_q, dim=1)  # 使用所有动作的Q值计算概率
+        entropy = - (probs * torch.log(probs + 1e-10)).sum(dim=1).mean()  # 计算熵
+        entropy_loss = -ENTROPY_COEFF * entropy  # 负号因为要最大化熵
+        
+        # 组合损失
+        total_loss = mse_loss + entropy_loss
         # 反向传播
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.online_net.parameters(), 2.0)
         self.optimizer.step()
+
+        # 动态调整beta
+        self.beta = min(1.0, self.beta + self.beta_increment)
 
         # 记录梯度
         grad_norms = [p.grad.norm().item() for p in self.online_net.parameters() if p.grad is not None]
         self.training_history['grad_norms'].append(np.mean(grad_norms) if grad_norms else 0)
 
+
         # 软更新目标网络
         self.soft_update_targets()
         
-        return loss.item()
+        return total_loss.item()
 
     def soft_update_targets(self):
         for t_param, o_param in zip(self.target_net.parameters(), self.online_net.parameters()):
@@ -181,6 +204,52 @@ class DQNAgent:
             action = q_values.argmax().item()
             self.training_history['action_dist'][action] += 1
             return action
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+        self.max_priority = 1.0
+
+    def add(self, experience):
+        """添加经验并初始化优先级"""
+        idx = self.pos % self.capacity
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(experience)
+        else:
+            self.buffer[idx] = experience
+        # 新经验初始优先级设为当前最大值
+        self.priorities[idx] = self.max_priority
+        self.pos += 1
+
+    def sample(self, batch_size, beta=0.4):
+        """带权重采样"""
+        if self.pos < self.capacity:
+            valid_len = self.pos
+        else:
+            valid_len = self.capacity
+        
+        # 计算采样概率
+        probs = self.priorities[:valid_len] ** self.alpha
+        probs /= probs.sum()
+        
+        # 按概率选择索引
+        indices = np.random.choice(valid_len, batch_size, p=probs)
+        
+        # 计算重要性采样权重
+        weights = (valid_len * probs[indices]) ** (-beta)
+        weights /= weights.max()  # 归一化
+        
+        return [self.buffer[i] for i in indices], indices, weights
+
+    def update_priorities(self, indices, priorities):
+        """更新采样经验的优先级"""
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = prio
+        self.max_priority = max(self.max_priority, priorities.max())
 
 class ModelManager:
     """模型管理组件"""
@@ -214,6 +283,7 @@ class ModelManager:
         self.agent.training_history = checkpoint['training_history']
         self.best_reward = checkpoint['best_reward']
         logger.info(f"加载检查点，最佳奖励：{self.best_reward:.2f}")
+    
     def plot_trading_decision(self, prices, actions, holdings, episode):
         """绘制交易决策图表"""
         plt.figure(figsize=(15, 8))
@@ -545,42 +615,22 @@ class StockTradingEnv:
         else:
             returns = 0.0
 
-        # # 2. 动态夏普率奖励 (滑动窗口)
-        # sharpe_reward = 0
-        # window_size = 30
-        # if len(self.portfolio_values) > window_size:
-        #     returns_series = np.diff(np.log(self.portfolio_values[-window_size:])) * 100
-        #     excess_returns = returns_series - 0.02/window_size  # 假设无风险利率2%年化
-        #     sharpe = np.mean(excess_returns) / (np.std(excess_returns) + 1e-9)
-        #     sharpe_reward = sharpe * 0.3  # 调整权重
+        # 2. 动态夏普率奖励 (滑动窗口)
+        sharpe_reward = 0
+        window_size = 30
+        if len(self.portfolio_values) > window_size:
+            returns_series = np.diff(np.log(self.portfolio_values[-window_size:])) * 100
+            excess_returns = returns_series - 0.02/window_size  # 假设无风险利率2%年化
+            sharpe = np.mean(excess_returns) / (np.std(excess_returns) + 1e-9)
+            sharpe_reward = sharpe * 0.3  # 调整权重
 
-        # # 3. 回撤惩罚 (动态计算)
-        # peak = np.max(self.portfolio_values)
-        # drawdown = (peak - current_value) / peak if peak > 0 else 0
-        # drawdown_penalty = -drawdown * 0.8  # 加大惩罚力度
-
-        # # 4. 波动率惩罚
-        # volatility_penalty = -np.std(np.diff(np.log(self.portfolio_values[-30:])))*100 if len(self.portfolio_values)>30 else 0
-
-        # # 5. 持仓变化惩罚 (减少频繁交易)
-        # position_change = abs(self.holdings - self.prev_holdings) if hasattr(self, 'prev_holdings') else 0
-        # turnover_penalty = -position_change * 0.1
-        # self.prev_holdings = self.holdings
-
-        # # 6. 胜率奖励 (长期窗口)
-        # win_rate_reward = 0
-        # if len(self.portfolio_values) > 100:
-        #     positive_returns = np.sum(np.diff(self.portfolio_values[-100:]) > 0)
-        #     win_rate = positive_returns / 99
-        #     win_rate_reward = 2.0 * (win_rate - 0.5)  # 胜率超过50%才奖励
+        # 3. 回撤惩罚 (动态计算)
+        peak = np.max(self.portfolio_values)
+        drawdown = (peak - current_value) / peak if peak > 0 else 0
+        drawdown_penalty = -drawdown * 0.8  # 加大惩罚力度
 
         # 组合奖励
-        total_reward = returns * 0.5
-            # sharpe_reward + 
-            # drawdown_penalty + 
-            # volatility_penalty * 0.3 + 
-            # turnover_penalty + 
-            # win_rate_reward
+        total_reward = returns * 0.5 + sharpe_reward +  drawdown_penalty 
         return total_reward
 
     def _get_state(self):
@@ -742,15 +792,15 @@ def train():
             pattern_reward = env._pattern_reward(action, current_pattern)
             # 组合奖励
             combined_reward = base_reward * 0.005 + pattern_reward * 20
-            agent.memory.append((state, action, combined_reward, next_state, done))
+            agent.memory.add((state, action, combined_reward, next_state, done))
             state = next_state
             total_base_reward += base_reward * 0.005
             total_pattern_reward += pattern_reward * 20
 
-            if len(agent.memory) >= BATCH_SIZE:
+            if len(agent.memory.buffer) >= BATCH_SIZE:
                 loss = agent.update()
-                if len(agent.memory) % 10 == 0:
-                    logger.info(f"Loss: {loss:.5f} | Grad Norm: {np.mean(agent.training_history['grad_norms'][-10:])}")
+                # if len(agent.memory.buffer) % 10 == 0:
+                #     logger.info(f"Loss: {loss:.5f} | Grad Norm: {np.mean(agent.training_history['grad_norms'][-10:])}")
 
         # 记录训练指标
         agent.training_history['rewards'].append(total_base_reward + total_pattern_reward)
@@ -772,6 +822,7 @@ def train():
             agent.training_history['action_dist'] = np.zeros(ACTION_DIM)
 
         logger.info(f"Episode {episode} | (Base: {total_base_reward:.1f}, Pattern: {total_pattern_reward:.1f})")
+
 def test(model_path):
     """测试模型"""
     data = load_and_process_data()

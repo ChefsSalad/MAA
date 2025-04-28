@@ -53,6 +53,51 @@ METRICS_DIR = "training_metrics"
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(METRICS_DIR, exist_ok=True)
 
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.pos = 0
+        self.max_priority = 1.0
+
+    def add(self, experience):
+        """添加经验并初始化优先级"""
+        idx = self.pos % self.capacity
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(experience)
+        else:
+            self.buffer[idx] = experience
+        # 新经验初始优先级设为当前最大值
+        self.priorities[idx] = self.max_priority
+        self.pos += 1
+
+    def sample(self, batch_size, beta=0.4):
+        """带权重采样"""
+        if self.pos < self.capacity:
+            valid_len = self.pos
+        else:
+            valid_len = self.capacity
+        
+        # 计算采样概率
+        probs = self.priorities[:valid_len] ** self.alpha
+        probs /= probs.sum()
+        
+        # 按概率选择索引
+        indices = np.random.choice(valid_len, batch_size, p=probs)
+        
+        # 计算重要性采样权重
+        weights = (valid_len * probs[indices]) ** (-beta)
+        weights /= weights.max()  # 归一化
+        
+        return [self.buffer[i] for i in indices], indices, weights
+
+    def update_priorities(self, indices, priorities):
+        """更新采样经验的优先级"""
+        for idx, prio in zip(indices, priorities):
+            self.priorities[idx] = prio
+        self.max_priority = max(self.max_priority, priorities.max())
 
 # ==================== 模型组件 ====================
 class FCGenerator(nn.Module):
@@ -128,13 +173,19 @@ class StockTradingAgent:
         self.opt_g = [optim.Adam(gen.parameters(), lr=LR_GENERATOR) for gen in self.generators]
         self.opt_d = [optim.Adam(dis.parameters(), lr=LR_DISCRIMINATOR) for dis in self.discriminators]
         
-        self.memory = deque(maxlen=MEMORY_SIZE)
+        # self.memory = deque(maxlen=MEMORY_SIZE)
         self.manager = ModelManager(self, None)
         self._init_training_history()
         self.epsilon_start = 1.0   # 初始探索率
         self.epsilon_end = 0.05    # 最终探索率
         self.epsilon_decay = 200    # 衰减周期（指数形式）
         self.current_episode = 0   # 新增episode计数器
+
+        self.memory = PrioritizedReplayBuffer(MEMORY_SIZE, alpha=0.6)
+        self.beta = 0.4  # 重要性采样补偿系数
+        self.beta_increment = 0.001  # 每次采样后的增量
+
+
 
     def _init_training_history(self):
         """扩展训练历史记录"""
@@ -214,7 +265,7 @@ class StockTradingAgent:
         self.opt_d[d_idx].step()
         return d_loss.item()
     
-    def _update_generator(self, states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch, g_idx):
+    def _update_generator(self, states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch, g_idx, indices):
         """群组生成器更新"""
         states = torch.FloatTensor(np.array(states_batch)).to(DEVICE)
         next_states = torch.FloatTensor(np.array(next_states_batch)).to(DEVICE)
@@ -240,6 +291,11 @@ class StockTradingAgent:
             for d_idx in range(3) 
             if d_idx != g_idx
         ) / (len(self.discriminators)-1)
+
+        # 计算TD误差作为优先级
+        td_errors = (current_q.squeeze() - target_q).abs().detach().cpu().numpy()
+        self.memory.update_priorities(indices, td_errors + 1e-5)  # 避免零优先级
+
 
         # 初始化总损失（核心损失）
         total_loss = dqn_loss + 0.2 * adv_loss
@@ -335,10 +391,11 @@ class StockTradingAgent:
 
     def update(self):
         """群组更新入口"""
-        if len(self.memory) < BATCH_SIZE:
+        if len(self.memory.buffer) < BATCH_SIZE:
             return
         
-        batch = random.sample(self.memory, BATCH_SIZE)
+        batch, indices, weights = self.memory.sample(BATCH_SIZE, self.beta)
+        weights = torch.tensor(weights, device=DEVICE, dtype=torch.float32)
         states_b, actions_b, rewards_b, next_states_b, dones_b = zip(*batch)
         
         # 并行更新所有判别器
@@ -351,7 +408,7 @@ class StockTradingAgent:
         # 并行更新所有生成器
         g_losses = []
         for g_idx in range(3):
-            dqn_loss, adv_loss = self._update_generator(states_b, actions_b, rewards_b, next_states_b, dones_b, g_idx)
+            dqn_loss, adv_loss = self._update_generator(states_b, actions_b, rewards_b, next_states_b, dones_b, g_idx, indices)
             self.training_history['dqn_losses'][g_idx].append(dqn_loss)
             self.training_history['adv_losses'][g_idx].append(adv_loss)
             g_losses.append(dqn_loss + adv_loss)
@@ -440,13 +497,13 @@ class ModelManager:
             returns = (portfolio_history[-1] - self.env.init_balance) / self.env.init_balance
             metrics['total_returns'].append(returns)
             
-            returns_series = np.diff(portfolio_history) / portfolio_history[:-1]
-            sharpe = np.mean(returns_series) / (np.std(returns_series) + 1e-9)
-            metrics['sharpe_ratios'].append(sharpe)
+            # returns_series = np.diff(portfolio_history) / portfolio_history[:-1]
+            # sharpe = np.mean(returns_series) / (np.std(returns_series) + 1e-9)
+            # metrics['sharpe_ratios'].append(sharpe)
             
-            peak = np.maximum.accumulate(portfolio_history)
-            drawdown = (peak - portfolio_history) / peak
-            metrics['max_drawdowns'].append(np.max(drawdown))
+            # peak = np.maximum.accumulate(portfolio_history)
+            # drawdown = (peak - portfolio_history) / peak
+            # metrics['max_drawdowns'].append(np.max(drawdown))
 
             # 将每个回合的步骤信息存储到文件中
             with open(f'step_history_episode{_}.json', 'w') as f:
@@ -458,20 +515,20 @@ class ModelManager:
         return {
             'mean_return': np.mean(metrics['total_returns']),
             'std_return': np.std(metrics['total_returns']),
-            'sharpe_ratio': np.mean(metrics['sharpe_ratios']),
-            'max_drawdown': np.mean(metrics['max_drawdowns']),
+            # 'sharpe_ratio': np.mean(metrics['sharpe_ratios']),
+            # 'max_drawdown': np.mean(metrics['max_drawdowns']),
             'action_dist': metrics['action_dist'].tolist(),
             'steps': metrics['steps']  # 返回每个回合的步骤信息
         }
 
-    def _calculate_drawdown(self, portfolio_values):
-        """计算最大回撤"""
-        max_drawdowns = []
-        for pv in portfolio_values:
-            peak = np.maximum.accumulate(pv)
-            trough = np.minimum.accumulate(pv)
-            max_drawdowns.append(np.max((peak - trough)/peak))
-        return np.mean(max_drawdowns)
+    # def _calculate_drawdown(self, portfolio_values):
+    #     """计算最大回撤"""
+    #     max_drawdowns = []
+    #     for pv in portfolio_values:
+    #         peak = np.maximum.accumulate(pv)
+    #         trough = np.minimum.accumulate(pv)
+    #         max_drawdowns.append(np.max((peak - trough)/peak))
+    #     return np.mean(max_drawdowns)
 
     def evaluate_generators(self, n_episodes=3):
         """评估单个生成器性能"""
@@ -505,7 +562,7 @@ class ModelManager:
         fake_samples = {i: [] for i in range(3)}
         
         # 采样真实数据
-        batch = random.sample(self.agent.memory, batch_size)
+        batch, indices, weights = self.memory.sample(BATCH_SIZE, self.beta)
         states, _, _, _, _ = zip(*batch)
         real_states = torch.FloatTensor(np.array(states)).to(DEVICE)
         real_price = real_states[:, :, :PRICE_FEATURES].reshape(-1, PRICE_FEATURES)
@@ -868,7 +925,7 @@ def train():
         while not done:
             action = agent.get_action(state)
             next_state, reward, done, _ = env.step(action)
-            agent.memory.append((
+            agent.memory.add((
                 state.copy() if isinstance(state, np.ndarray) else state.cpu().numpy(),
                 action,
                 reward,
@@ -878,16 +935,16 @@ def train():
             state = next_state
             total_reward += reward
 
-            if len(agent.memory) >= BATCH_SIZE:
+            if len(agent.memory.buffer) >= BATCH_SIZE:
                 d_losses, g_losses = agent.update()
-                if len(agent.memory) % 10 == 0:
-                    recent_memory = list(agent.memory)[-BATCH_SIZE:]
-                    states_tensor = torch.FloatTensor(np.array([s[0] for s in recent_memory])).to(DEVICE)
-                    for g_idx, generator in enumerate(agent.generators):
-                        q_values = generator(states_tensor)[0].detach().cpu().numpy()
-                        logger.info(
-                            f"Q Values - Gen{g_idx}: {q_values.mean():.2f}±{q_values.std():.2f}"
-                        )
+                # if len(agent.memory) % 10 == 0:
+                #     recent_memory = list(agent.memory)[-BATCH_SIZE:]
+                #     states_tensor = torch.FloatTensor(np.array([s[0] for s in recent_memory])).to(DEVICE)
+                #     for g_idx, generator in enumerate(agent.generators):
+                #         q_values = generator(states_tensor)[0].detach().cpu().numpy()
+                #         logger.info(
+                #             f"Q Values - Gen{g_idx}: {q_values.mean():.2f}±{q_values.std():.2f}"
+                #         )
 
         if episode % EVAL_INTERVAL == 1:
             # 评估生成器
