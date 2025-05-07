@@ -12,9 +12,7 @@
 ---
 
 ## Overall paradigm
-![MAA-TSF.svg](MAA-TSF.svg)
-
-## Brief Intro
+## ![MAA-TSF.svg](MAA-TSF.svg) Brief Intro
 
 A multi-period group crossover and multi-factor pheromone transmission mechanism, grounded in the MAA framework, empowers individual agents to selectively attend to salient local signals, thereby enhancing their representational capacity, while simultaneously enabling adaptive and efficient collaborative modeling across agents.
 
