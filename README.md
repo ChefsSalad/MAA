@@ -157,8 +157,7 @@ MAATSF/
 ├── trainer/
 │   ├── baseframe_trainer.py      # Base training class
 │   ├── multiGAN_trainer.py       # MAA training for regression 
-│   └── multiGAN_trainer_disccls.py # MAA training for regression 
-&classification
+│   └── multiGAN_trainer_disccls.py # MAA training for regression&classification
 └── utils/
     ├── __init__.py
     ├── evaluate_visualization.py # Visualization for model evaluation
